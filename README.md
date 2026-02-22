@@ -176,30 +176,106 @@ To view pre-computed results without re-running, open `ID1_Section_B_executed_ne
 
 ---
 
-## Methodology Notes
+## Methodology
 
-### Dark/Light Colour Separation (Task 3.02)
+### 1. NIR Spectroscopy & the Physics of Polymer Fingerprinting
 
-Rather than applying blind statistical outlier detection, we use **physically motivated colour-based separation**. Carbon black pigment in dark/black plastics absorbs broadband across 1550–1950 nm, suppressing the polymer-specific absorption features that kNN relies on. These spectra are systematically different from light-coloured spectra of the same polymer and degrade classifier performance if included in training.
+NIR spectroscopy identifies polymers by measuring how molecular bonds absorb infrared light. Each polymer has a characteristic absorption fingerprint driven by the overtone and combination bands of its dominant bonds — C–H stretches in polyolefins (PE, PP), C=O stretches in polyesters (PET, PLA, PC), and N–H bands in polyamides (PA6, PA66). The PlasTell Desktop operates in **transflectance mode** at 1550–1950 nm with 128 wavelength channels: light passes through the sample, reflects off a diffuse reflector, and returns through the sample, effectively doubling the optical path length and enhancing signal strength for thin materials.
 
-**86 dark spectra** were identified and separated via:
-- Automatic detection from PlasTell colour metadata (black-labelled samples)
-- Manual heatmap inspection for data_source2 spectra lacking metadata (62 overrides)
-- 1 measurement outlier (PET.12 — sensor/placement error)
+Absorption depth is governed by the **Beer-Lambert law**:
 
-The separated dark spectra are not discarded — they are analysed separately and used in the two-stage dark-plastic classification extension.
+```
+A(λ) = ε(λ) · c · l
+```
 
-### kNN vs Weighted kNN: Choosing the Right Metric
+where `ε(λ)` is the wavelength-dependent molar absorptivity (polymer-specific), `c` is concentration, and `l` is optical path length (sample thickness). This has two direct consequences for preprocessing:
 
-Both models achieve 93% accuracy, but their error profiles differ:
+- **Thin films** (< 1 mm) produce weaker signals due to shorter path length — mitigation is stacking or folding samples before scanning
+- **Carbon black pigment** in dark plastics absorbs broadband across the entire 1550–1950 nm range, saturating the detector and suppressing the polymer-specific absorption peaks that classifiers rely on — these spectra must be handled separately (see Section 3)
+
+---
+
+### 2. Data Pipeline & Cleaning
+
+Raw data arrives as two CSV exports from the PlasTell instrument and a lab reference dataset, requiring systematic preprocessing before any modelling:
+
+**2.1 — Source merging and transposition**
+Both sources use different orientations (samples as rows vs. columns). The pipeline transposes the instrument export into a consistent wavelength × spectra matrix (128 × 334), then concatenates with the reference dataset to yield 669 spectra across 15 polymer classes.
+
+**2.2 — Duplicate detection via SHA-256 hashing**
+Rather than checking for exact numerical equality (which is fragile under floating-point representation), each spectrum is serialised and hashed. This identified and removed 3 exact duplicates, yielding 666 unique spectra. Hash-based deduplication is preferred over column-wise comparison because it is O(n) and handles floating-point collisions correctly.
+
+**2.3 — Invalid value repair**
+A small number of spectra contain NaN or zero-valued channels caused by detector saturation or read errors at specific wavelengths. These are repaired via **linear interpolation** between the nearest valid neighbours rather than dropped, preserving the spectral shape. Dropping affected channels would distort the 128-dimensional feature space and bias distance metrics in kNN.
+
+---
+
+### 3. Dark-Spectrum Separation (Physics-Motivated Outlier Removal)
+
+Standard outlier detection methods (z-score, IQR, isolation forest) operate statistically — they flag samples that are numerically unusual relative to the dataset distribution. For this problem, that approach fails because dark spectra are not statistical noise: they are a **physically distinct class** that happens to share a polymer label with light-coloured samples.
+
+Carbon black pigment absorbs broadband across 1550–1950 nm via electronic transitions, raising the baseline absorption uniformly across all wavelength channels and suppressing the narrow, polymer-specific overtone peaks. The result is a flat, featureless spectrum that carries no polymer identity information. Including these in training contaminates the per-class feature distributions and degrades classifier decision boundaries.
+
+**Separation approach:**
+- **Automatic:** PlasTell colour metadata tags black-labelled samples directly — these are separated without manual inspection
+- **Manual validation:** The lab reference dataset (`data_source2`) lacks colour metadata. A heatmap of all spectra sorted by mean reflectance was inspected manually; 62 spectra were overridden as dark based on their flat, elevated-baseline profile
+- **Single measurement outlier:** PET.12 was removed due to a clearly anomalous spike profile consistent with a sensor placement error, not a dark-plastic effect
+
+This yields **580 light spectra** for classification and **86 dark spectra** analysed separately.
+
+**Impact:** Removing dark spectra yields consistent +6–8 pp accuracy gains across all models, confirming they were acting as systematic noise rather than informative training signal:
+
+| Model | Before | After | Gain |
+|-------|:------:|:-----:|:----:|
+| kNN (k=5) | 87.1% | 93.4% | +6.3 pp |
+| Weighted kNN (k=5) | 89.2% | 94.8% | +5.6 pp |
+| SVM (RBF) | 77.5% | 85.5% | +8.0 pp |
+
+---
+
+### 4. Feature Space & Dimensionality
+
+Each spectrum is represented as a **128-dimensional vector** of reflectance values at fixed wavelength intervals. No manual feature engineering is applied — the raw spectral values serve directly as features. This is appropriate because:
+
+- NIR spectra are dense and smooth; adjacent channels are highly correlated
+- kNN operates directly in the raw feature space using Euclidean distance, which is well-suited to spectral data where the overall shape (not individual peaks) drives similarity
+- SVM with an RBF kernel learns a non-linear decision boundary in the same space
+
+**PCA analysis** (extension) confirms the feature space is highly structured: the first 3 principal components capture **84.9% of total variance** (PC1=43.8%, PC2=29.5%, PC3=11.6%), suggesting polymer classes occupy well-separated low-dimensional manifolds in NIR space. This validates the use of distance-based classifiers.
+
+---
+
+### 5. Model Selection & Hyperparameter Tuning
+
+**Why kNN?**
+kNN is a natural fit for spectral classification because polymer NIR spectra form tight, well-separated clusters in feature space. After dark-spectrum removal, intra-class spectral variation is low (consistent with stable polymer chemistry), making the nearest-neighbour heuristic highly reliable. kNN also provides interpretable predictions — the identity of the k nearest neighbours can be inspected directly.
+
+**Grid search over k:**
+k was swept from 1 to 15 using stratified 50/50 train-test splits. k=1 is optimal (97% accuracy) after dark removal, confirming that intra-class variation is low enough that the single nearest neighbour is the most reliable predictor. At larger k, minority classes (LDPE, PLA, TPU) are increasingly outvoted by majority-class neighbours, degrading macro F1.
+
+**Why not SVM alone?**
+SVM (RBF, default C and γ) achieves 85.5% — competitive but underperforms kNN by ~11 pp without hyperparameter tuning. SVM is more sensitive to class imbalance and requires careful regularisation; with a 10:1 class ratio (PMMA=143, TPU=15) and default parameters, minority classes are poorly separated. kNN with SMOTE oversampling is a more tractable solution for this dataset scale.
+
+**Distance-weighted kNN and the certainty threshold:**
+The weighted variant assigns prediction confidence as the ratio of votes from the majority class among the k nearest neighbours. A threshold of 0.6 flags predictions below this confidence as "Uncertain", routing them to manual inspection. This trades 4.1% throughput (12 uncertain samples) for a substantially lower false-positive rate on high-contamination-risk misclassifications (e.g., PVC predicted as PET).
 
 | Metric | When it matters | Model preference |
 |--------|----------------|-----------------|
 | **Precision** | Contamination is costly (PVC in PET stream) | Weighted kNN (0.97 vs 0.93) |
-| **Recall** | Losing recyclable material is costly | Standard kNN (slightly higher for PET) |
-| **Macro F1** | All polymer classes matter equally | Weighted kNN (excluding Uncertain class) |
+| **Recall** | Losing recyclable material is costly | Standard kNN |
+| **Macro F1** | All polymer classes matter equally | Weighted kNN (F1=0.927 vs 0.902) |
 
-**Recommendation:** Weighted kNN for deployment — the certainty threshold (0.6) converts low-confidence wrong predictions into "Uncertain" flags routed to manual inspection, reducing contamination risk.
+---
+
+### 6. Class Imbalance Handling
+
+The dataset has a 10:1 class ratio (PMMA=143 vs TPU=15). Two strategies are compared:
+
+**SMOTE (Synthetic Minority Oversampling Technique):** Generates synthetic minority-class samples by interpolating between real samples in feature space. Applied to the training split only (never the test set) to avoid data leakage. Improves LDPE F1 from 0.59 to 0.86 — the largest single-class gain.
+
+**Class-weighted kNN:** Scales the vote contribution of each neighbour by the inverse of its class frequency, upweighting minority-class votes. Achieves identical overall accuracy (95.9%) to SMOTE without generating synthetic data — preferable in production where data augmentation introduces distributional assumptions.
+
+Both strategies match at 95.9% accuracy / macro F1=0.951, slightly below the unbalanced k=1 optimum (97%) because oversampling/reweighting introduces a bias-variance tradeoff — minority class recall improves at the cost of slight majority-class precision loss.
 
 ---
 
